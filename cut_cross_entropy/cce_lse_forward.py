@@ -107,25 +107,30 @@ def _cce_lse_forward_kernel(
         else:
             target_offs_b = offs_b
 
-        this_targets = tl.load(Targets + target_offs_b, mask=target_offs_b < BMax, other=V + 1)
+        this_targets = tl.load(Targets + target_offs_b, mask=target_offs_b < BMax, other=-1)
 
-        offs_b = (pid_b * BLOCK_B + tl.arange(0, BLOCK_B)).to(tl.int64)
+        direct_offs_b = (pid_b * BLOCK_B + tl.arange(0, BLOCK_B)).to(tl.int64)
+        target_match = (
+            (direct_offs_b[:, None] < B)
+            & (offs_v[None, :] < V)
+            & (this_targets[:, None] == offs_v[None, :])
+        )
 
-        neg_correct_logit_ptrs = NegCorrectLogit + offs_b
+        neg_correct_logit_ptrs = NegCorrectLogit + direct_offs_b
 
         neg_correct_logit_ptrs = tl.broadcast_to(
             neg_correct_logit_ptrs[:, None], (BLOCK_B, BLOCK_V)
         )
-        tl.store(neg_correct_logit_ptrs, -logits, mask=this_targets[:, None] == offs_v[None, :])
+        tl.store(neg_correct_logit_ptrs, -logits, mask=target_match)
     else:
-        offs_b = (pid_b * BLOCK_B + tl.arange(0, BLOCK_B)).to(tl.int64)
+        direct_offs_b = (pid_b * BLOCK_B + tl.arange(0, BLOCK_B)).to(tl.int64)
 
     this_mx = tl.max(logits, axis=1)
     this_lse = this_mx + tl.log(tl.sum(tl.exp(logits - this_mx[:, None]), axis=1))
 
-    o_mask = offs_b < B
+    o_mask = direct_offs_b < B
 
-    lse_ptrs = LSE + offs_b
+    lse_ptrs = LSE + direct_offs_b
 
     this_locks = Locks + (pid_b // tl.cdiv(B, BLOCK_B * num_locks))
     while tl.atomic_cas(this_locks, 0, 1) == 1:

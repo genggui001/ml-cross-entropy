@@ -1,22 +1,31 @@
 # Copyright (C) 2024 Apple Inc. All Rights Reserved.
 from types import MethodType
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 import transformers
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers.models.llama.modeling_llama import (
-    _CONFIG_FOR_DOC,
-    LLAMA_INPUTS_DOCSTRING,
-    KwargsForCausalLM,
-    Unpack,
-)
 from transformers.utils import (
     add_start_docstrings_to_model_forward,
     replace_return_docstrings,
 )
+
+try:
+    from transformers.models.llama.modeling_llama import (
+        LLAMA_INPUTS_DOCSTRING,
+        _CONFIG_FOR_DOC,
+    )
+
+    _LLAMA_MODELING_LEGACY = True
+except ImportError:
+    from transformers.models.llama.configuration_llama import LlamaConfig
+
+    _CONFIG_FOR_DOC = LlamaConfig
+    LLAMA_INPUTS_DOCSTRING = ""
+    _LLAMA_MODELING_LEGACY = False
+
 
 from .utils import PatchOptions, TransformersModelT, apply_lce
 
@@ -38,8 +47,8 @@ def cce_forward(
     output_hidden_states: Optional[bool] = None,
     return_dict: Optional[bool] = None,
     cache_position: Optional[torch.LongTensor] = None,
-    num_logits_to_keep: int = 0,
-    **kwargs: Unpack[KwargsForCausalLM],
+    logits_to_keep: Union[int, torch.Tensor] = 0,
+    **kwargs: Any,
 ) -> Union[Tuple, CausalLMOutputWithPast]:
     r"""
     Args:
@@ -48,8 +57,8 @@ def cce_forward(
             config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
             (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
 
-        num_logits_to_keep (`int`, *optional*):
-            Calculate logits for the last `num_logits_to_keep` tokens. If `0`, calculate logits for all
+        logits_to_keep (`int` or `torch.Tensor`, *optional*):
+            Calculate logits for the last `logits_to_keep` tokens. If `0`, calculate logits for all
             `input_ids` (special case). Only last token logits are needed for generation, and calculating them only for that
             token can save memory, which becomes pretty significant for long sequences or large vocabulary size.
 
@@ -80,9 +89,11 @@ def cce_forward(
         else self.config.output_hidden_states
     )
     return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+    if "num_logits_to_keep" in kwargs:
+        logits_to_keep = kwargs.pop("num_logits_to_keep")
 
     # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-    outputs = self.model(
+    _model_kw: dict[str, Any] = dict(
         input_ids=input_ids,
         attention_mask=attention_mask,
         position_ids=position_ids,
@@ -91,10 +102,11 @@ def cce_forward(
         use_cache=use_cache,
         output_attentions=output_attentions,
         output_hidden_states=output_hidden_states,
-        return_dict=return_dict,
         cache_position=cache_position,
-        **kwargs,
     )
+    if _LLAMA_MODELING_LEGACY and return_dict is not None:
+        _model_kw["return_dict"] = return_dict
+    outputs = self.model(**_model_kw, **kwargs)
 
     hidden_states = outputs[0]
     loss = None
@@ -114,7 +126,10 @@ def cce_forward(
             ]
             logits = torch.cat(logits, dim=-1)
         else:
-            logits = self.lm_head(hidden_states[:, -num_logits_to_keep:, :])
+            _slice = (
+                slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            )
+            logits = self.lm_head(hidden_states[:, _slice, :])
 
         if labels is not None:
             loss = self.loss_function(

@@ -76,6 +76,30 @@ def _target_fn_test_vp(
 
     vp_c = c[vocab_parallel_options.start : vocab_parallel_options.stop].clone()
 
+    vp_loss_none, vp_lse_none = linear_cross_entropy(
+        e,
+        vp_c,
+        targets,
+        impl=impl,
+        vocab_parallel_options=vocab_parallel_options,
+        reduction="none",
+        return_lse=True,
+    )
+
+    loss_none, lse_none = linear_cross_entropy(
+        e,
+        c,
+        targets,
+        impl=impl,
+        reduction="none",
+        return_lse=True,
+    )
+
+    assert torch.isfinite(vp_loss_none).all(), "vp loss contains non-finite values"
+    assert torch.isfinite(vp_lse_none).all(), "vp lse contains non-finite values"
+    assert torch.allclose(vp_loss_none, loss_none, atol=error_tol), "vp loss not close"
+    assert torch.allclose(vp_lse_none, lse_none, atol=error_tol), "vp lse not close"
+
     vp_c.requires_grad_(True)
     e.requires_grad_(True)
     if z_loss:

@@ -44,6 +44,17 @@ def sort_logit_avg(logit_avg: torch.Tensor) -> torch.Tensor:
     return torch.argsort(logit_avg).to(torch.int32)
 
 
+def _remap_vocab_parallel_targets(
+    targets: torch.Tensor, vp_opts: VocabParallelOptions
+) -> torch.Tensor:
+    is_my_target = (targets >= vp_opts.start) & (targets < vp_opts.stop)
+    return torch.where(
+        is_my_target,
+        targets - vp_opts.start,
+        targets.new_full((), -1),
+    )
+
+
 class LinearCrossEntropyFunction(torch.autograd.Function):
     @staticmethod
     @torch.amp.custom_fwd(device_type="cuda")
@@ -80,18 +91,7 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
 
         targets = params.targets
         if (vp_opts := params.vocab_parallel_options) is not None:
-            is_my_target = (targets >= vp_opts.start) & (targets < vp_opts.stop)
-            targets = torch.where(
-                is_my_target,
-                targets - vp_opts.start,
-                ## NB
-                # The backward kernel already uses
-                # c.size(0) + 1 as the padding value to ensure that
-                # (targets.size(0) % block_size) == 0, so for targets
-                # that aren't in this VP rank's range, we can just consider
-                # them as padded and all work work as expected.
-                targets.new_full((), c.size(0) + 1),
-            )
+            targets = _remap_vocab_parallel_targets(targets, vp_opts)
 
         ret = cce_lse_forward_kernel(
             e=e,
@@ -108,11 +108,11 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
         neg_correct_logit = ret.neg_correct_logit
         logit_avg = ret.logit_avg
 
-        if params.vocab_parallel_options is not None:
-            lse = vp_reduce_lse(lse, pg=params.vocab_parallel_options.group)
+        if vp_opts is not None:
+            lse = vp_reduce_lse(lse, pg=vp_opts.group)
 
             neg_correct_logit = vp_reduce_correct_logit(
-                neg_correct_logit, pg=params.vocab_parallel_options.group, dtype=lse.dtype
+                neg_correct_logit, pg=vp_opts.group, dtype=lse.dtype
             )
 
         nll = neg_correct_logit.add_(lse)
@@ -170,18 +170,7 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
         reduce_e_grad = False
         pg = None
         if (vp_opts := params.vocab_parallel_options) is not None:
-            is_my_target = (targets >= vp_opts.start) & (targets < vp_opts.stop)
-            targets = torch.where(
-                is_my_target,
-                targets - vp_opts.start,
-                ## NB
-                # The backward kernel already uses
-                # c.size(0) + 1 as the padding value to ensure that
-                # (targets.size(0) % block_size) == 0, so for targets
-                # that aren't in this VP rank's range, we can just consider
-                # them as padded and all work work as expected.
-                targets.new_full((), c.size(0) + 1),
-            )
+            targets = _remap_vocab_parallel_targets(targets, vp_opts)
 
             reduce_e_grad = vp_opts.reduce_e_grad
             pg = vp_opts.group
