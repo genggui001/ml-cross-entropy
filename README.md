@@ -311,6 +311,145 @@ Expected output with A100 SMX4, PyTorch 2.4.1, and CUDA 12.4.
 8       baseline  loss-fw-bw       208.8    28000.0    gemma2
 ```
 
+#### `linear_cross_entropy_kl` fused-vs-dense notes
+
+Point-in-time measurements for the fixed-`T=1` `linear_cross_entropy_kl` path versus
+`_dense_linear_cross_entropy_kl`, collected on `NVIDIA A100-SXM4-80GB` with `bfloat16`
+and `warmup=1`.
+
+Reproduce with:
+
+```bash
+PYTHONPATH=$PWD python benchmark/linear_cross_entropy_kl.py sweep --preset=long-seq --dtype=bfloat16 --warmup=1
+PYTHONPATH=$PWD python benchmark/linear_cross_entropy_kl.py sweep --preset=batch-size --dtype=bfloat16 --warmup=1
+PYTHONPATH=$PWD python benchmark/linear_cross_entropy_kl.py sweep --preset=hidden-dim --dtype=bfloat16 --warmup=1
+```
+
+Long-sequence and vocab sweep:
+
+| Case | Dense total ms | Fused total ms | Fused - Dense ms | Dense peak MiB | Fused peak MiB | Fused - Dense MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `B=1, S=8192, V=4096, D=2048` | 11.86 | 17.26 | +5.40 | 1008.4 | 296.7 | -711.7 |
+| `B=1, S=16384, V=4096, D=2048` | 13.37 | 27.78 | +14.40 | 1968.5 | 514.1 | -1454.4 |
+| `B=1, S=32768, V=4096, D=2048` | 21.12 | 48.58 | +27.46 | 3888.8 | 946.7 | -2942.0 |
+| `B=1, S=65536, V=4096, D=2048` | 41.43 | 97.02 | +55.59 | 7729.3 | 1813.8 | -5915.4 |
+| `B=1, S=65536, V=8192, D=2048` | 81.74 | 173.10 | +91.36 | 14929.3 | 1878.4 | -13050.9 |
+
+Batch-size sweep at fixed `S=8192, V=4096, D=2048`:
+
+| Case | Dense total ms | Fused total ms | Fused - Dense ms | Dense peak MiB | Fused peak MiB | Fused - Dense MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `B=1` | 11.82 | 16.32 | +4.50 | 1008.4 | 296.7 | -711.7 |
+| `B=2` | 13.07 | 26.84 | +13.77 | 1968.5 | 514.1 | -1454.4 |
+| `B=4` | 21.11 | 49.83 | +28.72 | 3888.8 | 946.7 | -2942.0 |
+| `B=8` | 41.46 | 96.18 | +54.72 | 7729.3 | 1813.8 | -5915.4 |
+
+Hidden-dimension sweep at fixed `B=1, S=8192, V=4096`:
+
+| Case | Dense total ms | Fused total ms | Fused - Dense ms | Dense peak MiB | Fused peak MiB | Fused - Dense MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `D=1024` | 10.43 | 7.73 | -2.70 | 960.4 | 157.5 | -802.9 |
+| `D=2048` | 10.68 | 16.40 | +5.72 | 1008.4 | 295.9 | -712.4 |
+| `D=4096` | 11.95 | 27.77 | +15.83 | 1104.4 | 577.6 | -526.8 |
+
+Observed trends:
+
+- For fixed `V=4096, D=2048`, the batch-size sweep is nearly identical to the long-seq sweep once `N = B * S` matches. For example, `B=8, S=8192` and `B=1, S=65536` both land near `+55 ms` slowdown and save about `5.9 GiB`, so the slowdown is primarily tracking token count `N`, not whether `N` comes from batch or sequence.
+- `V` is the strongest extra multiplier once `N` is already large. At `N=65536, D=2048`, increasing `V` from `4096` to `8192` changes the fused-vs-dense total delta from `+55.59 ms` to `+91.36 ms`.
+- `D` also matters, but less than `N` and `V` in the tested range. At `N=8192, V=4096`, the fused-vs-dense total delta moves from `-2.70 ms` at `D=1024` to `+15.83 ms` at `D=4096`.
+- The fused path remains primarily a memory optimization. At `B=1, S=65536, V=8192, D=2048`, fused peak memory stays below `1.9 GiB` while dense reaches about `14.9 GiB`.
+
+Numerical accuracy:
+
+The same benchmark script can compare the fused path against two different references for both forward outputs
+and backward gradients:
+
+- `reference=dense`: compare against `_dense_linear_cross_entropy_kl` evaluated directly in the input dtype.
+- `reference=exact`: upcast the quantized inputs to float32 first, then evaluate the reference with strict float32 matmuls.
+
+Accuracy cases use the same hidden-state scaling as the unit tests:
+`student_h, teacher_h ~ N(0, 1 / sqrt(D))`, while `student_c` and `teacher_c`
+remain standard normal.
+
+Reproduce with:
+
+```bash
+PYTHONPATH=$PWD python benchmark/linear_cross_entropy_kl.py accuracy_sweep --preset=default --dtype=float32 --reference=exact
+PYTHONPATH=$PWD python benchmark/linear_cross_entropy_kl.py accuracy_sweep --preset=default --dtype=bfloat16 --reference=dense
+PYTHONPATH=$PWD python benchmark/linear_cross_entropy_kl.py accuracy_sweep --preset=default --dtype=bfloat16 --reference=exact
+```
+
+The accuracy commands pin `torch.set_float32_matmul_precision("highest")` so float32 references stay on
+strict float32 matmul instead of falling back to TF32. Point-in-time A100 results below report max absolute
+error. Relative error can look artificially large on near-zero gradients, so max-abs is the more stable
+summary metric here.
+
+`float32` against `reference=exact`:
+
+| Case | all max abs | ce max abs | kl max abs | grad_h max abs | grad_c max abs |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `B=1, S=256, V=32768, D=2048` | 3.814697e-06 | 1.907349e-06 | 1.668930e-06 | 1.788139e-07 | 3.783498e-10 |
+| `B=4, S=256, V=32768, D=2048` | 2.861023e-06 | 1.907349e-06 | 1.788139e-06 | 5.122274e-08 | 1.964509e-10 |
+| `B=1, S=8192, V=4096, D=2048` | 3.814697e-06 | 1.907349e-06 | 1.907349e-06 | 1.018634e-09 | 1.509761e-10 |
+
+`bfloat16` against `reference=dense`:
+
+| Case | all max abs | ce max abs | kl max abs | grad_h max abs | grad_c max abs |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `B=1, S=256, V=32768, D=2048` | 7.333755e-03 | 7.528305e-03 | 2.689362e-04 | 1.220703e-04 | 9.536743e-07 |
+| `B=4, S=256, V=32768, D=2048` | 7.741928e-03 | 7.712364e-03 | 3.195405e-04 | 3.051758e-05 | 4.768372e-07 |
+| `B=1, S=8192, V=4096, D=2048` | 8.093834e-03 | 7.872581e-03 | 1.972795e-03 | 3.814697e-06 | 1.192093e-07 |
+
+`bfloat16` against `reference=exact`:
+
+| Case | all max abs | ce max abs | kl max abs | grad_h max abs | grad_c max abs |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `B=1, S=256, V=32768, D=2048` | 1.335144e-05 | 8.583069e-06 | 5.841255e-06 | 6.190129e-05 | 5.745387e-07 |
+| `B=4, S=256, V=32768, D=2048` | 1.621246e-05 | 1.144409e-05 | 6.139278e-06 | 1.557544e-05 | 4.572212e-07 |
+| `B=1, S=8192, V=4096, D=2048` | 1.907349e-05 | 1.525879e-05 | 7.629395e-06 | 3.421213e-06 | 1.090411e-07 |
+
+Accuracy takeaways:
+
+- In `float32`, the fused path stays in the expected `e-6` range against the exact reference. Across these cases, `all_loss` max abs stays below `3.82e-06`, `ce_loss` below `1.91e-06`, and `kl_loss` below `1.91e-06`.
+- In `bfloat16`, the choice of reference matters a lot. Against the dense bf16 baseline, forward max abs stays around `7e-3` to `8e-3` for `all_loss`/`ce_loss`; against the exact float32-upcast reference, the same fused outputs are much closer, with `all_loss` max abs below `1.91e-05`, `ce_loss` below `1.53e-05`, and `kl_loss` below `7.63e-06`.
+- That gap between `bfloat16 vs dense` and `bfloat16 vs exact` shows that most of the apparent bf16 forward discrepancy comes from the dense bf16 reference materializing logits in bf16 before `target_logit`, `logsumexp`, and teacher-expectation terms are formed. The fused path keeps those forward accumulations in fp32, so it tracks the exact reference much more closely.
+- In `bfloat16`, backward gradients are still noisier than `float32`, but they remain well below the forward dense-reference gap. Against the exact reference, `grad_h` max abs stays below `6.20e-05` and `grad_c` below `5.75e-07`.
+
+Backward kernel breakdown:
+
+The fused backward path currently reconstructs logits, recovers probabilities from the saved LSE values,
+and runs both `_mm_backward` branches inside one Triton kernel. To attribute time by stage, the benchmark
+profiles four kernel variants and differences them:
+
+- `common-only`: `softmax/LSE/prob` work only
+- `common+dE`: common work plus the `dE` matmul-backward branch
+- `common+dC`: common work plus the `dC` accumulation branch
+- `full`: both `dE` and `dC`
+
+Reproduce with:
+
+```bash
+PYTHONPATH=$PWD python benchmark/linear_cross_entropy_kl.py profile_backward_sweep --preset=backward-breakdown --dtype=bfloat16 --warmup=1 --iters=5
+PYTHONPATH=$PWD python benchmark/linear_cross_entropy_kl.py profile_backward --batch_size=8 --seq_len=8192 --vocab_size=4096 --hidden_dim=2048 --dtype=bfloat16 --warmup=1 --iters=5
+```
+
+Point-in-time A100 bf16 results:
+
+| Case | Active rows | Common ms | dE extra ms | dC extra ms | Residual ms | Full kernel ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `B=1, S=8192, V=4096, D=2048` | 7784 | 0.11 | 4.42 | 4.47 | -0.75 | 8.25 |
+| `B=1, S=65536, V=4096, D=2048` | 62253 | 0.11 | 32.93 | 35.06 | -5.04 | 63.06 |
+| `B=1, S=65536, V=8192, D=2048` | 62272 | 0.11 | 65.09 | 69.79 | -11.09 | 123.90 |
+| `B=8, S=8192, V=4096, D=2048` | 62283 | 0.11 | 32.79 | 35.06 | -4.95 | 63.00 |
+
+Backward-kernel takeaways:
+
+- `softmax/LSE/prob` reconstruction is negligible in the tested large-token regimes, about `0.11 ms` or `0.1%` to `1.4%` of the full backward kernel.
+- The dominant costs are the two `_mm_backward` branches. `dC` is consistently a bit slower than `dE`, around `55%` versus `52%` of the full kernel time in the large-`N` cases.
+- Matching `N = B * S` gives nearly identical backward-kernel breakdowns: `B=8, S=8192, V=4096` and `B=1, S=65536, V=4096` both land near `63 ms` full-kernel time with almost the same `dE/dC` split.
+- Doubling `V` at fixed `N` roughly doubles both heavy branches: from about `33/35 ms` to about `65/70 ms` for `dE/dC`, which confirms that the backward slowdown is driven overwhelmingly by the matrix-product branches, especially the `dC` path, rather than by `softmax/LSE` reconstruction.
+- The residual term is negative because the full kernel shares some work and memory traffic between the `dE` and `dC` branches, so profiling them separately and summing the parts slightly overestimates the combined runtime.
+
 ### Development
 
 If dependencies are installed locally, `cut-cross-entropy` will work without a pip install as long as `python` is executed in the root path of the github repo.
