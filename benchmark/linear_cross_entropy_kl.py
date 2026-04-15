@@ -138,8 +138,8 @@ def _build_case_tensors(
         (case.batch_size, case.seq_len, case.hidden_dim),
         device="cuda",
         dtype=dtype,
-        requires_grad=True,
-    ) / hidden_scale
+    )
+    student_h = (student_h / hidden_scale).detach().requires_grad_(True)
     teacher_h = torch.randn(
         (case.batch_size, case.seq_len, case.hidden_dim),
         device="cuda",
@@ -600,6 +600,7 @@ def _fused_loss(
     teacher_c: torch.Tensor,
     *,
     alpha: float,
+    round_logits_to_input_dtype: bool,
 ) -> torch.Tensor:
     return linear_cross_entropy_kl(
         student_h,
@@ -609,6 +610,7 @@ def _fused_loss(
         teacher_c,
         alpha=alpha,
         reduction="none",
+        round_logits_to_input_dtype=round_logits_to_input_dtype,
     )
 
 
@@ -688,6 +690,7 @@ def _run_case(
     alpha: float,
     warmup: int,
     backward: bool,
+    round_logits_to_input_dtype: bool,
 ) -> tuple[BenchmarkResult, BenchmarkResult]:
     student_h, student_c, targets, teacher_h, teacher_c = _build_case_tensors(case, dtype=dtype)
 
@@ -711,7 +714,7 @@ def _run_case(
     )
 
     fused_result = _measure_impl(
-        "fused",
+        "fused-rounded" if round_logits_to_input_dtype else "fused-exact",
         lambda sh, sc, tg, th, tc: _fused_loss(
             sh,
             sc,
@@ -719,6 +722,7 @@ def _run_case(
             th,
             tc,
             alpha=alpha,
+            round_logits_to_input_dtype=round_logits_to_input_dtype,
         ),
         student_h,
         student_c,
@@ -763,6 +767,7 @@ def benchmark(
     alpha: float = 1.0,
     warmup: int = 1,
     backward: bool = True,
+    round_logits_to_input_dtype: bool = False,
 ) -> None:
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
@@ -770,7 +775,8 @@ def benchmark(
 
     case = BenchmarkCase("single", batch_size, seq_len, vocab_size, hidden_dim)
     print(
-        f"case: B={case.batch_size} S={case.seq_len} V={case.vocab_size} D={case.hidden_dim} dtype={dtype}"
+        f"case: B={case.batch_size} S={case.seq_len} V={case.vocab_size} D={case.hidden_dim} "
+        f"dtype={dtype} round_logits_to_input_dtype={round_logits_to_input_dtype}"
     )
     dense_result, fused_result = _run_case(
         case,
@@ -778,6 +784,7 @@ def benchmark(
         alpha=alpha,
         warmup=warmup,
         backward=backward,
+        round_logits_to_input_dtype=round_logits_to_input_dtype,
     )
     _print_case_delta(dense_result, fused_result)
 
@@ -788,6 +795,7 @@ def sweep(
     alpha: float = 1.0,
     warmup: int = 1,
     backward: bool = True,
+    round_logits_to_input_dtype: bool = False,
 ) -> None:
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
@@ -807,13 +815,17 @@ def sweep(
     dtype_obj = getattr(torch, dtype)
     for case in cases:
         print()
-        print(f"case: {case.name} | B={case.batch_size} S={case.seq_len} V={case.vocab_size} D={case.hidden_dim}")
+        print(
+            f"case: {case.name} | B={case.batch_size} S={case.seq_len} V={case.vocab_size} D={case.hidden_dim} "
+            f"round_logits_to_input_dtype={round_logits_to_input_dtype}"
+        )
         dense_result, fused_result = _run_case(
             case,
             dtype=dtype_obj,
             alpha=alpha,
             warmup=warmup,
             backward=backward,
+            round_logits_to_input_dtype=round_logits_to_input_dtype,
         )
         _print_case_delta(dense_result, fused_result)
 

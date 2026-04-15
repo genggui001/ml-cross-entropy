@@ -61,6 +61,11 @@ and likewise requires `student_c` and `teacher_c` to have identical shapes.
 :param return_components: If true, also returns `(student_ce_loss, kl_loss)` reduced the same way.
 :param chunk_size: Vocab chunk size used by the custom backward pass. Larger values
     usually improve backward speed at the cost of higher temporary memory usage.
+:param round_logits_to_input_dtype: If true, each logits tile is rounded to the
+    student/teacher input dtype before being cast back to fp32 for softmax / KL
+    statistics. This more closely matches paths that materialize bf16/fp16 logits
+    before computing CE / KL, while still preserving the higher-precision dot-product
+    accumulation used by those materialized-logits paths.
 :param vocab_parallel_options: Optional aligned vocab-parallel shard definition for both
     `student_c` and `teacher_c`. When provided, both classifier matrices are expected to
     contain the same local vocab range `[start, stop)` for the same process group.
@@ -126,6 +131,7 @@ def _linear_cross_entropy_kl_forward_splits_kernel(
     stride_teacher_student_sum_split,
     stride_teacher_teacher_sum_row,
     stride_teacher_teacher_sum_split,
+    ROUND_LOGITS_TO_INPUT_DTYPE: tl.constexpr,
     BLOCK_B: tl.constexpr,
     BLOCK_V: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -155,6 +161,9 @@ def _linear_cross_entropy_kl_forward_splits_kernel(
         global_offs_v = (vocab_start + local_offs_v).to(tl.int64)
         vocab_mask = local_offs_v < split_stop
 
+        # Keep the dot-product accumulator in fp32. `round_logits_to_input_dtype`
+        # later simulates materialized bf16/fp16 logits without changing the GEMM
+        # accumulation precision itself.
         student_logits = tl.zeros((BLOCK_B, BLOCK_V), dtype=tl.float32)
         teacher_logits = tl.zeros((BLOCK_B, BLOCK_V), dtype=tl.float32)
 
@@ -210,6 +219,18 @@ def _linear_cross_entropy_kl_forward_splits_kernel(
             teacher_h_ptrs += BLOCK_D * stride_teacher_h_hidden
             student_c_ptrs += BLOCK_D * stride_student_c_hidden
             teacher_c_ptrs += BLOCK_D * stride_teacher_c_hidden
+
+        if ROUND_LOGITS_TO_INPUT_DTYPE:
+            student_logits = student_logits.cast(
+                student_h_ptr.dtype.element_ty,
+                fp_downcast_rounding="rtne",
+            )
+            student_logits = student_logits.to(tl.float32)
+            teacher_logits = teacher_logits.cast(
+                teacher_h_ptr.dtype.element_ty,
+                fp_downcast_rounding="rtne",
+            )
+            teacher_logits = teacher_logits.to(tl.float32)
 
         student_logits = tl.where(vocab_mask[None, :], student_logits, -float("inf"))
         teacher_logits = tl.where(vocab_mask[None, :], teacher_logits, -float("inf"))
@@ -373,6 +394,7 @@ def _linear_cross_entropy_kl_backward_kernel(
     COMPUTE_DE: tl.constexpr,
     COMPUTE_DC: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
+    ROUND_LOGITS_TO_INPUT_DTYPE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     num_b_chunks = tl.cdiv(B, BLOCK_B)
@@ -433,6 +455,12 @@ def _linear_cross_entropy_kl_backward_kernel(
         teacher_h_ptrs += BLOCK_D * stride_teacher_h_hidden
         student_c_ptrs += BLOCK_D * stride_student_c_hidden
         teacher_c_ptrs += BLOCK_D * stride_teacher_c_hidden
+
+    if ROUND_LOGITS_TO_INPUT_DTYPE:
+        student_logits = student_logits.cast(E.dtype.element_ty, fp_downcast_rounding="rtne")
+        student_logits = student_logits.to(tl.float32)
+        teacher_logits = teacher_logits.cast(TeacherH.dtype.element_ty, fp_downcast_rounding="rtne")
+        teacher_logits = teacher_logits.to(tl.float32)
 
     student_ce_lse = tl.load(StudentCeLSE + offs_b, mask=offs_b < B, other=float("inf"))
     teacher_kl_lse = tl.load(TeacherKlLSE + offs_b, mask=offs_b < B, other=float("inf"))
@@ -537,6 +565,7 @@ def _linear_cross_entropy_kl_backward_launcher(
     vocab_start: int,
     need_student_h: bool,
     need_student_c: bool,
+    round_logits_to_input_dtype: bool,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     if not is_triton_greater_or_equal_3_2_0():
         assert student_h.dtype in (torch.float16, torch.bfloat16)
@@ -614,6 +643,7 @@ def _linear_cross_entropy_kl_backward_launcher(
         USE_KAHAN_C=use_kahan_c,
         USE_DE=need_student_h,
         USE_DC=need_student_c,
+        ROUND_LOGITS_TO_INPUT_DTYPE=round_logits_to_input_dtype,
         B_BIN=b_bin_fn(student_h.size(0)),
     )
 
@@ -689,6 +719,7 @@ class _LinearCrossEntropyKLFunction(torch.autograd.Function):
         teacher_c: torch.Tensor,
         alpha: float,
         chunk_size: int,
+        round_logits_to_input_dtype: bool,
         vocab_parallel_options: VocabParallelOptions | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         num_rows = targets.numel()
@@ -744,6 +775,7 @@ class _LinearCrossEntropyKLFunction(torch.autograd.Function):
             teacher_student_sum.stride(1),
             teacher_teacher_sum.stride(0),
             teacher_teacher_sum.stride(1),
+            ROUND_LOGITS_TO_INPUT_DTYPE=round_logits_to_input_dtype,
         )
 
         student_ce_row_max, student_ce_log_denom = _reduce_lse_stats(student_ce_max, student_ce_accu)
@@ -798,6 +830,7 @@ class _LinearCrossEntropyKLFunction(torch.autograd.Function):
         ctx.alpha = float(alpha)
         ctx.chunk_size = int(chunk_size)
         ctx.vocab_start = int(vocab_start)
+        ctx.round_logits_to_input_dtype = bool(round_logits_to_input_dtype)
         ctx.save_for_backward(
             student_h,
             student_c,
@@ -870,8 +903,9 @@ class _LinearCrossEntropyKLFunction(torch.autograd.Function):
             vocab_start=ctx.vocab_start,
             need_student_h=need_student_h,
             need_student_c=need_student_c,
+            round_logits_to_input_dtype=ctx.round_logits_to_input_dtype,
         )
-        return grad_student_h_out, grad_student_c_out, None, None, None, None, None, None
+        return grad_student_h_out, grad_student_c_out, None, None, None, None, None, None, None
 
 
 def _zero_like_reduced(
@@ -943,6 +977,7 @@ def linear_cross_entropy_kl(
     reduction: str = "mean",
     return_components: Literal[False] = False,
     chunk_size: int = 16384,
+    round_logits_to_input_dtype: bool = False,
     vocab_parallel_options: VocabParallelOptions | None = None,
 ) -> torch.Tensor: ...
 
@@ -960,6 +995,7 @@ def linear_cross_entropy_kl(
     reduction: str = "mean",
     return_components: Literal[True],
     chunk_size: int = 16384,
+    round_logits_to_input_dtype: bool = False,
     vocab_parallel_options: VocabParallelOptions | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]: ...
 
@@ -976,6 +1012,7 @@ def linear_cross_entropy_kl(
     reduction: str = "mean",
     return_components: bool = False,
     chunk_size: int = 16384,
+    round_logits_to_input_dtype: bool = False,
     vocab_parallel_options: VocabParallelOptions | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Computes fused student CE + alpha * forward KL distillation.
@@ -1042,6 +1079,7 @@ def linear_cross_entropy_kl(
         teacher_c,
         float(alpha),
         int(chunk_size),
+        bool(round_logits_to_input_dtype),
         vocab_parallel_options,
     )
 
@@ -1063,6 +1101,7 @@ class LinearCrossEntropyKL(nn.Module):
         reduction: str = "mean",
         return_components: bool = False,
         chunk_size: int = 16384,
+        round_logits_to_input_dtype: bool = False,
         vocab_parallel_options: VocabParallelOptions | None = None,
     ) -> None:
         super().__init__()
@@ -1071,6 +1110,7 @@ class LinearCrossEntropyKL(nn.Module):
         self.reduction = reduction
         self.return_components = return_components
         self.chunk_size = chunk_size
+        self.round_logits_to_input_dtype = round_logits_to_input_dtype
         self.vocab_parallel_options = vocab_parallel_options
 
     def forward(
@@ -1092,5 +1132,6 @@ class LinearCrossEntropyKL(nn.Module):
             reduction=self.reduction,
             return_components=self.return_components,
             chunk_size=self.chunk_size,
+            round_logits_to_input_dtype=self.round_logits_to_input_dtype,
             vocab_parallel_options=self.vocab_parallel_options,
         )

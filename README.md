@@ -315,14 +315,15 @@ Expected output with A100 SMX4, PyTorch 2.4.1, and CUDA 12.4.
 
 Point-in-time measurements for the fixed-`T=1` `linear_cross_entropy_kl` path versus
 `_dense_linear_cross_entropy_kl`, collected on `NVIDIA A100-SXM4-80GB` with `bfloat16`
-and `warmup=1`.
+and `warmup=1`. Unless otherwise noted, the sweep tables below use the default
+`round_logits_to_input_dtype=False` fused path.
 
 Reproduce with:
 
 ```bash
-PYTHONPATH=$PWD python benchmark/linear_cross_entropy_kl.py sweep --preset=long-seq --dtype=bfloat16 --warmup=1
-PYTHONPATH=$PWD python benchmark/linear_cross_entropy_kl.py sweep --preset=batch-size --dtype=bfloat16 --warmup=1
-PYTHONPATH=$PWD python benchmark/linear_cross_entropy_kl.py sweep --preset=hidden-dim --dtype=bfloat16 --warmup=1
+PYTHONPATH=$PWD python benchmark/linear_cross_entropy_kl.py sweep --preset=long-seq --dtype=bfloat16 --warmup=1 --round_logits_to_input_dtype=False
+PYTHONPATH=$PWD python benchmark/linear_cross_entropy_kl.py sweep --preset=batch-size --dtype=bfloat16 --warmup=1 --round_logits_to_input_dtype=False
+PYTHONPATH=$PWD python benchmark/linear_cross_entropy_kl.py sweep --preset=hidden-dim --dtype=bfloat16 --warmup=1 --round_logits_to_input_dtype=False
 ```
 
 Long-sequence and vocab sweep:
@@ -358,6 +359,36 @@ Observed trends:
 - `V` is the strongest extra multiplier once `N` is already large. At `N=65536, D=2048`, increasing `V` from `4096` to `8192` changes the fused-vs-dense total delta from `+55.59 ms` to `+91.36 ms`.
 - `D` also matters, but less than `N` and `V` in the tested range. At `N=8192, V=4096`, the fused-vs-dense total delta moves from `-2.70 ms` at `D=1024` to `+15.83 ms` at `D=4096`.
 - The fused path remains primarily a memory optimization. At `B=1, S=65536, V=8192, D=2048`, fused peak memory stays below `1.9 GiB` while dense reaches about `14.9 GiB`.
+
+Rounded-logits benchmark (`round_logits_to_input_dtype`):
+
+The benchmark entry points also accept `--round_logits_to_input_dtype=True/False` so the
+fused path can be measured in both modes. The rounded mode keeps the fp32 dot-product
+accumulator, but rounds each logits tile back to the input dtype before the fp32
+softmax / KL statistics are formed.
+
+Reproduce with:
+
+```bash
+PYTHONPATH=$PWD python benchmark/linear_cross_entropy_kl.py benchmark --dtype=bfloat16 --alpha=1.0 --warmup=1 --backward=True --round_logits_to_input_dtype=False
+PYTHONPATH=$PWD python benchmark/linear_cross_entropy_kl.py benchmark --dtype=bfloat16 --alpha=1.0 --warmup=1 --backward=True --round_logits_to_input_dtype=True
+PYTHONPATH=$PWD python benchmark/linear_cross_entropy_kl.py benchmark --batch_size=2 --seq_len=512 --vocab_size=151936 --hidden_dim=2048 --dtype=bfloat16 --alpha=1.0 --warmup=1 --backward=True --round_logits_to_input_dtype=False
+PYTHONPATH=$PWD python benchmark/linear_cross_entropy_kl.py benchmark --batch_size=2 --seq_len=512 --vocab_size=151936 --hidden_dim=2048 --dtype=bfloat16 --alpha=1.0 --warmup=1 --backward=True --round_logits_to_input_dtype=True
+```
+
+Point-in-time A100 bf16 results:
+
+| Case | Dense ms (fwd / bwd / total) | Dense peak MiB (fwd / total) | Fused exact ms (fwd / bwd / total) | Fused exact peak MiB (fwd / total) | Fused rounded ms (fwd / bwd / total) | Fused rounded peak MiB (fwd / total) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `B=4, S=256, V=32768, D=2048` | `8.96 / 2.98 / 11.94` | `1176.3 / 1176.3` | `3.09 / 10.74 / 13.83` | `289.0 / 676.3` | `3.61 / 12.08 / 15.69` | `289.0 / 676.3` |
+| `B=2, S=512, V=151936, D=2048` | `17.21 / 12.40 / 29.61` | `5369.8 / 5369.8` | `11.13 / 42.17 / 53.31` | `1224.6 / 3006.5` | `10.77 / 41.47 / 52.24` | `1224.6 / 3006.5` |
+
+Rounded-logits takeaways:
+
+- Peak memory is unchanged in these measurements. The rounding step happens on the temporary logits tile before the fp32 softmax / KL reductions, so it does not introduce an extra large activation buffer.
+- On the smaller default case, rounded mode is modestly slower than exact mode: `+0.52 ms` forward, `+1.34 ms` backward, and `+1.86 ms` total.
+- On the larger `V=151936` case, rounded and exact are effectively tied for memory and very close in runtime; in this point measurement, rounded came in `1.07 ms` faster overall (`-0.36 ms` forward, `-0.70 ms` backward), which is within the kind of run-to-run noise expected for single-shot timings.
+- The main reason to enable rounded mode is numerical parity with paths that materialize bf16/fp16 logits, not a consistent throughput win.
 
 Numerical accuracy:
 
